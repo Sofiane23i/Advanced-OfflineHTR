@@ -44,7 +44,8 @@ def char_list_from_file() -> List[str]:
 def train(model: Model,
           loader: DataLoaderIAM,
           line_mode: bool,
-          early_stopping: int = 25) -> None:
+          early_stopping: int = 25,
+          augmentation: bool = False) -> None:
     """Trains NN."""
     epoch = 0  # number of training epochs since start
     summary_char_error_rates = []
@@ -53,7 +54,20 @@ def train(model: Model,
     train_loss_in_epoch = []
     average_train_loss = []
 
-    preprocessor = Preprocessor(get_img_size(line_mode), data_augmentation=True, line_mode=line_mode)
+    # expand training set if augmentation is enabled (3x: original + 2 augmented copies)
+    if augmentation:
+        augmentation_factor = 3
+        original_train_samples = loader.train_samples.copy()
+        loader.train_samples = original_train_samples * augmentation_factor
+        print(f'Augmentation enabled: expanding training set by {augmentation_factor}x')
+
+    # print dataset sizes
+    num_train_images = len(loader.train_samples)
+    num_val_images = len(loader.validation_samples)
+    print(f'Number of training images: {num_train_images}')
+    print(f'Number of validation images: {num_val_images}')
+
+    preprocessor = Preprocessor(get_img_size(line_mode), data_augmentation=True, line_mode=line_mode, extra_augmentation=augmentation)
     best_char_error_rate = float('inf')  # best validation character error rate
     no_improvement_since = 0  # number of epochs no improvement of character error rate occurred
     # stop training after this number of epochs without improvement
@@ -130,6 +144,7 @@ def validate(model: Model, loader: DataLoaderIAM, line_mode: bool) -> Tuple[floa
     char_error_rate = num_char_err / num_char_total
     word_accuracy = num_word_ok / num_word_total
     print(f'Character error rate: {char_error_rate * 100.0}%. Word accuracy: {word_accuracy * 100.0}%.')
+    print(f'Number of validation images: {num_word_total}')
     return char_error_rate, word_accuracy
 
 
@@ -153,6 +168,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument('--mode', choices=['train', 'validate', 'infer'], default='infer')
     parser.add_argument('--decoder', choices=['bestpath', 'beamsearch', 'wordbeamsearch'], default='bestpath')
+    parser.add_argument('--arch', choices=['blstm', 'transformer'], default='blstm',
+                        help='Backbone architecture: bidirectional LSTM (blstm) or Transformer.')
     parser.add_argument('--batch_size', help='Batch size.', type=int, default=100)
     parser.add_argument('--data_dir', help='Directory containing IAM dataset.', type=Path, required=False)
     parser.add_argument('--fast', help='Load samples from LMDB.', action='store_true')
@@ -160,6 +177,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--img_file', help='Image used for inference.', type=Path, default='../data/word.png')
     parser.add_argument('--early_stopping', help='Early stopping epochs.', type=int, default=25)
     parser.add_argument('--dump', help='Dump output of NN to CSV file(s).', action='store_true')
+    parser.add_argument('--augmentation', help='Apply extra data augmentation (rotation, noise).', action='store_true')
 
     return parser.parse_args()
 
@@ -173,6 +191,7 @@ def main():
                        'beamsearch': DecoderType.BeamSearch,
                        'wordbeamsearch': DecoderType.WordBeamSearch}
     decoder_type = decoder_mapping[args.decoder]
+    arch = args.arch
 
     # train the model
     if args.mode == 'train':
@@ -190,18 +209,18 @@ def main():
         with open(FilePaths.fn_corpus, 'w') as f:
             f.write(' '.join(loader.train_words + loader.validation_words))
 
-        model = Model(char_list, decoder_type)
-        train(model, loader, line_mode=args.line_mode, early_stopping=args.early_stopping)
+        model = Model(char_list, decoder_type, arch=arch)
+        train(model, loader, line_mode=args.line_mode, early_stopping=args.early_stopping, augmentation=args.augmentation)
 
     # evaluate it on the validation set
     elif args.mode == 'validate':
         loader = DataLoaderIAM(args.data_dir, args.batch_size, fast=args.fast)
-        model = Model(char_list_from_file(), decoder_type, must_restore=True)
+        model = Model(char_list_from_file(), decoder_type, must_restore=True, arch=arch)
         validate(model, loader, args.line_mode)
 
     # infer text on test image
     elif args.mode == 'infer':
-        model = Model(char_list_from_file(), decoder_type, must_restore=True, dump=args.dump)
+        model = Model(char_list_from_file(), decoder_type, must_restore=True, dump=args.dump, arch=arch)
         infer(model, args.img_file)
 
 

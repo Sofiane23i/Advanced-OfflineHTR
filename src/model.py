@@ -19,19 +19,28 @@ class DecoderType:
 
 
 class Model:
-    """Minimalistic TF model for HTR."""
+    """Minimalistic TF model for HTR with selectable backbone (BLSTM or Transformer)."""
 
     def __init__(self,
                  char_list: List[str],
                  decoder_type: str = DecoderType.BestPath,
                  must_restore: bool = False,
-                 dump: bool = False) -> None:
-        """Init model: add CNN, RNN and CTC and initialize TF."""
+                 dump: bool = False,
+                 arch: str = 'blstm') -> None:
+        """Init model: add CNN, sequence backbone and CTC and initialize TF.
+
+        :param char_list: list of characters
+        :param decoder_type: CTC decoder type
+        :param must_restore: if True, restore from checkpoint
+        :param dump: if True, dump RNN/Transformer output
+        :param arch: 'blstm' (default) or 'transformer'
+        """
         self.dump = dump
         self.char_list = char_list
         self.decoder_type = decoder_type
         self.must_restore = must_restore
         self.snap_ID = 0
+        self.arch = arch
 
         # Whether to use normalization over a batch or a population
         self.is_train = tf.compat.v1.placeholder(tf.bool, name='is_train')
@@ -39,9 +48,12 @@ class Model:
         # input image batch
         self.input_imgs = tf.compat.v1.placeholder(tf.float32, shape=(None, None, None))
 
-        # setup CNN, RNN and CTC
+        # setup CNN, sequence backbone (BLSTM or Transformer) and CTC
         self.setup_cnn()
-        self.setup_rnn()
+        if self.arch == 'transformer':
+            self.setup_transformer()
+        else:
+            self.setup_rnn()
         self.setup_ctc()
 
         # setup optimizer to train NN
@@ -78,7 +90,7 @@ class Model:
         self.cnn_out_4d = pool
 
     def setup_rnn(self) -> None:
-        """Create RNN layers."""
+        """Create BLSTM layers (original architecture)."""
         rnn_in3d = tf.squeeze(self.cnn_out_4d, axis=[2])
 
         # basic cells which is used to build RNN
@@ -101,6 +113,110 @@ class Model:
         kernel = tf.Variable(tf.random.truncated_normal([1, 1, num_hidden * 2, len(self.char_list) + 1], stddev=0.1))
         self.rnn_out_3d = tf.squeeze(tf.nn.atrous_conv2d(value=concat, filters=kernel, rate=1, padding='SAME'),
                                      axis=[2])
+
+    def setup_transformer(self) -> None:
+        """Create Transformer encoder layers to replace BLSTM backbone.
+
+        The output shape matches the original rnn_out_3d: BxTxC (logits per time step).
+        """
+        # Input from CNN: BxTxF (after squeezing height dimension)
+        x = tf.squeeze(self.cnn_out_4d, axis=[2])  # BxTxF
+
+        # Model dimensions
+        d_model = 256
+        num_heads = 8
+        dff = 512
+        num_layers = 5
+
+        # Project CNN features to d_model
+        x = tf.keras.layers.Dense(d_model)(x)
+
+        # Add simple sinusoidal positional encoding
+        position = tf.shape(x)[1]
+        pos_encoding = self._positional_encoding(position, d_model)
+        x += pos_encoding
+
+        # Apply Transformer encoder blocks
+        mask = None
+        for i in range(num_layers):
+            with tf.compat.v1.variable_scope(f'transformer_layer_{i}'):
+                # Multi-head self-attention
+                attn_output = self._multi_head_attention(x, x, x, num_heads, d_model, mask)
+                # Add & norm
+                x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x + attn_output)
+
+                # Feed-forward network
+                ffn_output = self._point_wise_feed_forward_network(x, d_model, dff)
+                # Add & norm
+                x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x + ffn_output)
+
+        # Final projection to character logits (including CTC blank)
+        logits = tf.keras.layers.Dense(len(self.char_list) + 1)(x)
+        self.rnn_out_3d = logits  # BxTxC
+
+    def _positional_encoding(self, position, d_model):
+        """Sinusoidal positional encoding.
+
+        Returns tensor of shape (1, position, d_model) to be broadcast over batch.
+        """
+        angle_rads = self._get_angles(position, d_model)
+        # apply sin to even indices in the array; 2i
+        sines = tf.sin(angle_rads[:, 0::2])
+        # apply cos to odd indices in the array; 2i+1
+        cosines = tf.cos(angle_rads[:, 1::2])
+
+        pos_encoding = tf.reshape(tf.stack([sines, cosines], axis=-1), [position, d_model])
+        pos_encoding = tf.expand_dims(pos_encoding, 0)
+        return pos_encoding
+
+    @staticmethod
+    def _get_angles(position, d_model):
+        angle_rates = 1 / tf.pow(10000.0, (2 * (tf.range(d_model, dtype=tf.float32) // 2)) / tf.cast(d_model, tf.float32))
+        positions = tf.cast(tf.range(position), tf.float32)[:, tf.newaxis]
+        return positions * angle_rates[tf.newaxis, :]
+
+    @staticmethod
+    def _split_heads(x, batch_size, num_heads, depth):
+        x = tf.reshape(x, (batch_size, -1, num_heads, depth))
+        return tf.transpose(x, perm=[0, 2, 1, 3])
+
+    @staticmethod
+    def _combine_heads(x, batch_size, num_heads, depth):
+        x = tf.transpose(x, perm=[0, 2, 1, 3])
+        return tf.reshape(x, (batch_size, -1, num_heads * depth))
+
+    def _multi_head_attention(self, v, k, q, num_heads, d_model, mask):
+        depth = d_model // num_heads
+        batch_size = tf.shape(q)[0]
+
+        wq = tf.keras.layers.Dense(d_model)(q)
+        wk = tf.keras.layers.Dense(d_model)(k)
+        wv = tf.keras.layers.Dense(d_model)(v)
+
+        q_split = self._split_heads(wq, batch_size, num_heads, depth)
+        k_split = self._split_heads(wk, batch_size, num_heads, depth)
+        v_split = self._split_heads(wv, batch_size, num_heads, depth)
+
+        # scaled dot-product attention
+        matmul_qk = tf.matmul(q_split, k_split, transpose_b=True)  # (B, heads, T, T)
+        dk = tf.cast(tf.shape(k_split)[-1], tf.float32)
+        scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
+
+        if mask is not None:
+            scaled_attention_logits += (mask * -1e9)
+
+        attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
+        output = tf.matmul(attention_weights, v_split)  # (B, heads, T, depth)
+
+        output = self._combine_heads(output, batch_size, num_heads, depth)  # (B, T, d_model)
+        output = tf.keras.layers.Dense(d_model)(output)
+        return output
+
+    @staticmethod
+    def _point_wise_feed_forward_network(x, d_model, dff):
+        x = tf.keras.layers.Dense(dff, activation=tf.nn.relu)(x)
+        x = tf.keras.layers.Dense(d_model)(x)
+        return x
 
     def setup_ctc(self) -> None:
         """Create CTC loss and decoder."""
@@ -146,14 +262,18 @@ class Model:
             self.wbs_input = tf.nn.softmax(self.ctc_in_3d_tbc, axis=2)
 
     def setup_tf(self) -> Tuple[tf.compat.v1.Session, tf.compat.v1.train.Saver]:
-        """Initialize TF."""
+        """Initialize TF session and saver (separate checkpoints per architecture)."""
         print('Python: ' + sys.version)
         print('Tensorflow: ' + tf.__version__)
 
         sess = tf.compat.v1.Session()  # TF session
 
         saver = tf.compat.v1.train.Saver(max_to_keep=1)  # saver saves model to file
-        model_dir = '../model/'
+        # Use separate checkpoint directories for different backbones
+        if self.arch == 'transformer':
+            model_dir = '../model_transformer/'
+        else:
+            model_dir = '../model/'
         latest_snapshot = tf.train.latest_checkpoint(model_dir)  # is there a saved model?
 
         # if model must be restored (for inference), there must be a snapshot

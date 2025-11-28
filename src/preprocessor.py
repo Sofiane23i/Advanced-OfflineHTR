@@ -13,7 +13,8 @@ class Preprocessor:
                  padding: int = 0,
                  dynamic_width: bool = False,
                  data_augmentation: bool = False,
-                 line_mode: bool = False) -> None:
+                 line_mode: bool = False,
+                 extra_augmentation: bool = False) -> None:
         # dynamic width only supported when no data augmentation happens
         assert not (dynamic_width and data_augmentation)
         # when padding is on, we need dynamic width enabled
@@ -24,6 +25,7 @@ class Preprocessor:
         self.dynamic_width = dynamic_width
         self.data_augmentation = data_augmentation
         self.line_mode = line_mode
+        self.extra_augmentation = extra_augmentation
 
     @staticmethod
     def _truncate_label(text: str, max_text_len: int) -> str:
@@ -98,6 +100,21 @@ class Preprocessor:
         # data augmentation
         img = img.astype(np.float)
         if self.data_augmentation:
+            # extra augmentation: small rotation and noise
+            if self.extra_augmentation:
+                # small rotation left or right (between -5 and +5 degrees)
+                angle = random.uniform(-5.0, 5.0)
+                h, w = img.shape
+                center = (w / 2, h / 2)
+                rot_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+                img = cv2.warpAffine(img, rot_matrix, (w, h), borderMode=cv2.BORDER_REPLICATE)
+
+                # add salt-and-pepper / gaussian noise
+                if random.random() < 0.5:
+                    noise_sigma = random.uniform(5, 20)
+                    noise = np.random.normal(0, noise_sigma, img.shape)
+                    img = np.clip(img + noise, 0, 255)
+
             # photometric data augmentation
             if random.random() < 0.25:
                 def rand_odd():

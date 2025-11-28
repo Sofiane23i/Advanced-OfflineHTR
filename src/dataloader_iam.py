@@ -39,7 +39,15 @@ class DataLoaderIAM:
         f = open(data_dir / 'gt/words.txt')
         chars = set()
         bad_samples_reference = ['a01-117-05-02', 'r06-022-03-05']  # known broken images in IAM dataset
+        
+        # Split based on line numbers: lines 1-55090 for train, rest for validation
+        # (instead of percentage-based split)
+        train_split_line = 55081
+        line_number = 0
+        
         for line in f:
+            line_number += 1
+            
             # ignore empty and comment lines
             line = line.strip()
             if not line or line[0] == '#':
@@ -66,8 +74,15 @@ class DataLoaderIAM:
             # put sample into list
             self.samples.append(Sample(gt_text, file_name))
 
-        # split into training and validation set: 95% - 5%
-        split_idx = int(data_split * len(self.samples))
+        # Split into training and validation set based on line numbers
+        # Lines 1-55090 = train, rest = validation
+        # Old percentage-based split (commented out):
+        # split_idx = int(data_split * len(self.samples))
+        # self.train_samples = self.samples[:split_idx]
+        # self.validation_samples = self.samples[split_idx:]
+        
+        # New line-based split
+        split_idx = min(train_split_line, len(self.samples))
         self.train_samples = self.samples[:split_idx]
         self.validation_samples = self.samples[split_idx:]
 
